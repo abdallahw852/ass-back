@@ -1,0 +1,100 @@
+services:
+  postgres-write:
+    image: postgres:17-alpine
+    container_name: asas_postgres_write
+    environment:
+      POSTGRES_USER: ${WRITE_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${WRITE_DB_PASS:-postgres}
+      POSTGRES_DB: ${WRITE_DB_NAME:-asas_write}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_write_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${WRITE_DB_USER:-postgres}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+
+  redis:
+    image: redis:8-alpine
+    container_name: asas_redis
+    command: redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.3
+    container_name: asas_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - ELASTIC_PASSWORD=${ELASTICSEARCH_PASSWORD:-changeme}
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - '9200:9200'
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          "curl -s -u elastic:${ELASTICSEARCH_PASSWORD:-changeme} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    command: sh -c "pnpm install && pnpm build && echo '=== dist contents ===' && ls dist/ && echo '=== find main ===' && find dist/ -name 'main*' && echo '=== starting watch ===' && pnpm start:dev"
+    container_name: asas_app
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+      - ./nest-cli.json:/app/nest-cli.json
+      - ./tsconfig.json:/app/tsconfig.json
+      - ./tsconfig.build.json:/app/tsconfig.build.json
+      - ./package.json:/app/package.json
+      - ./pnpm-lock.yaml:/app/pnpm-lock.yaml
+      - ./pnpm-workspace.yaml:/app/pnpm-workspace.yaml
+    ports:
+      - '8080:8080'
+      - '9229:9229'
+    environment:
+      - NODE_ENV=development
+      - WRITE_DB_HOST=postgres-write
+      - WRITE_DB_PORT=5432
+      - READ_DB_HOST=postgres-write
+      - READ_DB_PORT=5432
+      - READ_DB_USER=${WRITE_DB_USER:-postgres}
+      - READ_DB_PASS=${WRITE_DB_PASS:-postgres}
+      - READ_DB_NAME=${WRITE_DB_NAME:-asas_write}
+      - REDIS_HOST=redis
+      - ELASTICSEARCH_NODE=http://elasticsearch:9200
+    depends_on:
+      postgres-write:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_write_data:
+  redis_data:
+  elasticsearch_data:
