@@ -1,0 +1,237 @@
+name: Deploy — Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false # never cancel a running production deploy
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ── Job 1: Build on GitHub-hosted runner (no source on server) ──────────────
+  build:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push runner image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push migrator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: migrator
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}:migrator-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository }}:migrator-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Job 2: Deploy on production server (pulls image, no source code) ─────────
+  deploy:
+    name: Deploy to Production
+    needs: build
+    runs-on: [self-hosted, production]
+
+    environment:
+      name: production
+      url: https://api.asasgate.net
+
+    env:
+      COMPOSE_FILE: docker-compose.production.yml
+      APP_IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+      MIGRATOR_IMAGE: ghcr.io/${{ github.repository }}:migrator-${{ github.sha }}
+
+    steps:
+      # ── 1. Checkout infrastructure config only (no src/) ─────────────────────
+      - name: Checkout infrastructure config
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: false
+          sparse-checkout: |
+            docker-compose.production.yml
+            nginx/
+          sparse-checkout-cone-mode: false
+
+      # ── 2. Write production env file from GitHub secrets ─────────────────────
+      - name: Create production env file
+        run: |
+          cat > .env << 'EOF'
+          NODE_ENV="production"
+          PORT="3000"
+          API_PREFIX="api/v1"
+
+          # ── Write DB (OCI PostgreSQL primary) ─────────────────────────────────
+          WRITE_DB_HOST="${{ secrets.WRITE_DB_HOST }}"
+          WRITE_DB_PORT="${{ secrets.WRITE_DB_PORT }}"
+          WRITE_DB_USER="${{ secrets.WRITE_DB_USER }}"
+          WRITE_DB_PASS="${{ secrets.WRITE_DB_PASS }}"
+          WRITE_DB_NAME="${{ secrets.WRITE_DB_NAME }}"
+          WRITE_DB_SSL="true"
+
+          # ── Read DB (OCI PostgreSQL read replica) ─────────────────────────────
+          READ_DB_HOST="${{ secrets.READ_DB_HOST }}"
+          READ_DB_PORT="${{ secrets.READ_DB_PORT }}"
+          READ_DB_USER="${{ secrets.READ_DB_USER }}"
+          READ_DB_PASS="${{ secrets.READ_DB_PASS }}"
+          READ_DB_NAME="${{ secrets.READ_DB_NAME }}"
+          READ_DB_SSL="true"
+
+          # ── Redis (Redis Cloud) ──────────────────────────────────────────────
+          REDIS_PRIMARY_URL="${{ secrets.REDIS_PRIMARY_URL }}"
+          REDIS_REPLICA_URL="${{ secrets.REDIS_REPLICA_URL }}"
+
+          # ── Elasticsearch ────────────────────────────────────────────────────
+          ELASTICSEARCH_NODE="http://elasticsearch:9200"
+          ELASTICSEARCH_USERNAME="elastic"
+          ELASTICSEARCH_PASSWORD="${{ secrets.ELASTICSEARCH_PASSWORD }}"
+
+          # ── JWT ──────────────────────────────────────────────────────────────
+          JWT_SECRET="${{ secrets.JWT_SECRET }}"
+          JWT_ACCESS_EXPIRES="15m"
+          JWT_REFRESH_EXPIRES="7d"
+          JWT_ISSUER="asas-os"
+          JWT_AUDIENCE="asas-os-clients"
+
+          # ── Paymob ───────────────────────────────────────────────────────────
+          PAYMOB_SECRET_KEY="${{ secrets.PAYMOB_SECRET_KEY }}"
+          PAYMOB_API_KEY="${{ secrets.PAYMOB_API_KEY }}"
+          PAYMOB_HMAC_SECRET="${{ secrets.PAYMOB_HMAC_SECRET }}"
+          PAYMOB_BASE_URL="${{ secrets.PAYMOB_BASE_URL }}"
+          PAYMOB_SUBSCRIPTION_WEBHOOK_URL="${{ secrets.PAYMOB_SUBSCRIPTION_WEBHOOK_URL }}"
+          PAYMOB_WEBHOOK_URL="${{ secrets.PAYMOB_WEBHOOK_URL }}"
+          PAYMOB_NOTIFICATION_URL="${{ secrets.PAYMOB_NOTIFICATION_URL }}"
+          PAYMOB_REDIRECTION_URL="${{ secrets.PAYMOB_REDIRECTION_URL }}"
+          PAYMOB_INTEGRATION_ID="${{ secrets.PAYMOB_INTEGRATION_ID }}"
+          PAYMOB_MOTO_INTEGRATION_ID="${{ secrets.PAYMOB_MOTO_INTEGRATION_ID }}"
+
+          # ── Oracle Buckets (OCI Object Storage) ──────────────────────────────
+          OCI_REGION="${{ secrets.OCI_REGION }}"
+          OCI_NAMESPACE="${{ secrets.OCI_NAMESPACE }}"
+          OCI_BUCKET="${{ secrets.OCI_BUCKET }}"
+          OCI_TENANCY="${{ secrets.OCI_TENANCY }}"
+          OCI_USER="${{ secrets.OCI_USER }}"
+          OCI_FINGERPRINT="${{ secrets.OCI_FINGERPRINT }}"
+          OCI_PRIVATE_KEY="${{ secrets.OCI_PRIVATE_KEY }}"
+
+          # ── SMTP ─────────────────────────────────────────────────────────────
+          SMTP_HOST="${{ secrets.SMTP_HOST }}"
+          SMTP_PORT="${{ secrets.SMTP_PORT }}"
+          SMTP_SECURE="${{ secrets.SMTP_SECURE }}"
+          SMTP_USER="${{ secrets.SMTP_USER }}"
+          SMTP_PASS="${{ secrets.SMTP_PASS }}"
+          SMTP_FROM="${{ secrets.SMTP_FROM }}"
+
+          # ── Sessions ─────────────────────────────────────────────────────────
+          SESSION_SECRET="${{ secrets.SESSION_SECRET }}"
+          SESSION_COOKIE_NAME="sid"
+          SESSION_COOKIE_DOMAIN=".asasgate.net"
+          SESSION_COOKIE_SECURE="true"
+          SESSION_TTL_SECONDS="604800"
+
+          # ── OTP ──────────────────────────────────────────────────────────────
+          OTP_LENGTH="6"
+          OTP_TTL_SECONDS="300"
+          OTP_RESEND_WINDOW_SECONDS="60"
+          OTP_MAX_ATTEMPTS="5"
+
+          # ── App ──────────────────────────────────────────────────────────────
+          CORS_ORIGINS="https://asasgate.net"
+          APP_URL="${{ secrets.APP_URL }}"
+          PASSWORD_RESET_PATH="${{ secrets.PASSWORD_RESET_PATH }}"
+          EOF
+
+          # Strip leading whitespace, remove comment lines and blank lines
+          sed -i 's/^[[:space:]]*//; /^#/d; /^$/d' .env
+          echo "APP_IMAGE=\"${APP_IMAGE}\"" >> .env
+
+      # ── 3. Log in to GHCR & pull images ──────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull Docker images
+        run: |
+          docker pull $APP_IMAGE
+          docker pull $MIGRATOR_IMAGE
+
+      # ── 4. Run DB migrations against OCI PostgreSQL ───────────────────────────
+      - name: Run DB migrations
+        run: |
+          # Production DB is external (OCI) — use --network host to reach it
+          docker run --rm --network host \
+            -e NODE_ENV=production \
+            -e WRITE_DB_HOST="${{ secrets.WRITE_DB_HOST }}" \
+            -e WRITE_DB_PORT="${{ secrets.WRITE_DB_PORT }}" \
+            -e WRITE_DB_USER="${{ secrets.WRITE_DB_USER }}" \
+            -e WRITE_DB_PASS="${{ secrets.WRITE_DB_PASS }}" \
+            -e WRITE_DB_NAME="${{ secrets.WRITE_DB_NAME }}" \
+            -e WRITE_DB_SSL=true \
+            $MIGRATOR_IMAGE
+
+      # ── 5. Start infra + deploy app ───────────────────────────────────────────
+      - name: Deploy containers
+        run: |
+          docker compose -f $COMPOSE_FILE up -d elasticsearch
+          docker compose -f $COMPOSE_FILE up -d --no-deps --force-recreate app nginx certbot
+          docker image prune -f
+
+      # ── 6. Health-check ───────────────────────────────────────────────────────
+      - name: Health check
+        run: |
+          echo "Waiting for app to become healthy..."
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' asas_production_app 2>/dev/null || echo "missing")
+            echo "  attempt $i/30 → $STATUS"
+            if [ "$STATUS" = "healthy" ]; then
+              echo "✅ App is healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ Health check timed out"
+          docker logs asas_production_app --tail 60
+          exit 1
+
+      # ── 7. Notify on failure ──────────────────────────────────────────────────
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Deployment to production FAILED. Check the logs above."

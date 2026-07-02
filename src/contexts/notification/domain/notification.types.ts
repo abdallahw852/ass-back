@@ -1,0 +1,15 @@
+export enum NotificationType {
+  ORDER_PAID = 'order_paid',
+  ORDER_SHIPPED = 'order_shipped',
+  ORDER_DELIVERED = 'order_delivered',
+  ORDER_RELEASED = 'order_released',
+  ORDER_COMPLETED = 'order_completed',
+  ORDER_DISPUTED = 'order_disputed',
+  ORDER_REFUNDED = 'order_refunded',
+  ORDER_CANCELLED = 'order_cancelled',
+  MESSAGE_RECEIVED = 'message_received',
+  SUPPLIER_APPROVED = 'supplier_approved',
+  SUPPLIER_REJECTED = 'supplier_rejected',
+  PRODUCT_APPROVED = 'product_approved',
+  PRODUCT_REJECTED = 'product_rejected',
+}

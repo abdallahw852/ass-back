@@ -1,0 +1,10 @@
+node_modules
+.env
+.env.staging
+dist
+build
+config
+*.tsbuildinfo
+uploads/*
+.DS_Store
+.claude/worktrees/
